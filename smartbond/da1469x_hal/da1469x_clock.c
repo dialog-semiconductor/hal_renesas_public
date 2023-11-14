@@ -37,30 +37,172 @@ static uint32_t g_mcu_clock_rc32m_freq;
 
 uint32_t SystemCoreClock = RC32M_FREQ;
 
+enum {
+    XTALRDY_CLK_SEL_32KHz = 0x0,
+    XTALRDY_CLK_SEL_256KHz
+} XTALRDY_CLK_SEL;
+
+#define CLK_FREQ_TRIM_REG_SET(_field, _val) \
+    CRG_XTAL->CLK_FREQ_TRIM_REG = \
+    ((CRG_XTAL->CLK_FREQ_TRIM_REG & ~CRG_XTAL_CLK_FREQ_TRIM_REG_ ## _field ## _Msk) | \
+    (((_val) << CRG_XTAL_CLK_FREQ_TRIM_REG_ ## _field ## _Pos) & \
+    CRG_XTAL_CLK_FREQ_TRIM_REG_ ## _field ## _Msk))
+
+#define CLK_FREQ_TRIM_REG_GET(_field) \
+    ((CRG_XTAL->CLK_FREQ_TRIM_REG & CRG_XTAL_CLK_FREQ_TRIM_REG_ ## _field ## _Msk) >> \
+    CRG_XTAL_CLK_FREQ_TRIM_REG_ ## _field ## _Pos)
+
+#define XTAL32M_CTRL2_REG_SET(_field, _val) \
+    CRG_XTAL->XTAL32M_CTRL2_REG = \
+    ((CRG_XTAL->XTAL32M_CTRL2_REG & ~CRG_XTAL_XTAL32M_CTRL2_REG_ ## _field ## _Msk) | \
+    (((_val) << CRG_XTAL_XTAL32M_CTRL2_REG_ ## _field ## _Pos) & \
+    CRG_XTAL_XTAL32M_CTRL2_REG_ ## _field ## _Msk))
+
+#define XTAL32M_CTRL2_REG_GET(_field) \
+    ((CRG_XTAL->XTAL32M_CTRL2_REG & CRG_XTAL_XTAL32M_CTRL2_REG_ ## _field ## _Msk) >> \
+    CRG_XTAL_XTAL32M_CTRL2_REG_ ## _field ## _Pos)
+
+#define XTALRDY_CTRL_REG_SET(_field, _val) \
+    CRG_XTAL->XTALRDY_CTRL_REG = \
+    ((CRG_XTAL->XTALRDY_CTRL_REG & ~CRG_XTAL_XTALRDY_CTRL_REG_ ## _field ## _Msk) | \
+    (((_val) << CRG_XTAL_XTALRDY_CTRL_REG_ ## _field ## _Pos) &  \
+    CRG_XTAL_XTALRDY_CTRL_REG_ ## _field ## _Msk))
+
+#define XTALRDY_CTRL_REG_GET(_field) \
+    ((CRG_XTAL->XTALRDY_CTRL_REG & CRG_XTAL_XTALRDY_CTRL_REG_ ## _field ## _Msk) >> \
+    CRG_XTAL_XTALRDY_CTRL_REG_ ## _field ## _Pos)
+
+#define XTALRDY_STAT_REG_GET(_field) \
+    ((CRG_XTAL->XTALRDY_STAT_REG & CRG_XTAL_XTALRDY_STAT_REG_ ## _field ## _Msk) >> \
+    CRG_XTAL_XTALRDY_STAT_REG_ ## _field ## _Pos)
+
+/*
+   OTPC is clocked by the system clock. Therefore, its timing settings
+   should be adjusted upon system clock update.
+ */
+static inline void
+da1469x_clock_adjust_otp_access_timings(void)
+{
+    /* Get the high-speed clock divider (AHB bus) */
+    uint8_t hclk_div = (CRG_TOP->CLK_AMBA_REG & CRG_TOP_CLK_AMBA_REG_HCLK_DIV_Msk);
+
+    /* Compute the actual core speed */
+    uint32_t core_speed = (SystemCoreClock >> ((hclk_div < 4) ? hclk_div : 4/*1xx = divide by 16*/));
+
+    da1469x_otp_set_speed(core_speed);
+}
+
 static inline bool
 da1469x_clock_is_xtal32m_settled(void)
 {
-    return ((*(volatile uint32_t *)0x5001001c & 0xff00) == 0) &&
-           ((*(volatile uint32_t *)0x50010054 & 0x000f) != 0xb);
+    return !!((CRG_XTAL->XTALRDY_STAT_REG & CRG_XTAL_XTALRDY_STAT_REG_XTALRDY_COUNT_Msk) == 0 &&
+              (CRG_XTAL->XTAL32M_STAT1_REG & CRG_XTAL_XTAL32M_STAT1_REG_XTAL32M_STATE_Msk) == 0x8 /*XTAL_RUN state*/);
+}
+
+static inline bool
+da1469x_clock_sys_pll_switch_check_restrictions(void)
+{
+    bool ret = 0;
+
+    /* HDIV and PDIV should both be 0 */
+    ret |= !((CRG_TOP->CLK_AMBA_REG & CRG_TOP_CLK_AMBA_REG_HCLK_DIV_Msk) == 0 &&
+             (CRG_TOP->CLK_AMBA_REG & CRG_TOP_CLK_AMBA_REG_PCLK_DIV_Msk) == 0);
+
+
+    /* Switch to PLL is only allowed when the current system clock is XTAL32M */
+    ret |= !((CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_XTAL32M_Msk) ||
+             (CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_PLL96M_Msk));
+
+    /* 0 for success and 1 for failure. */
+    return ret;
+}
+
+static inline bool
+da1469x_clock_sys_xtal32m_switch_check_restrictions(void)
+{
+    bool ret = 0;
+
+    /* XTAL32M should be enabled by PDC */
+    ret |= !((CRG_TOP->POWER_CTRL_REG & CRG_TOP_POWER_CTRL_REG_LDO_RADIO_ENABLE_Msk) ||
+             ((DCDC->DCDC_CTRL1_REG & DCDC_DCDC_CTRL1_REG_DCDC_ENABLE_Msk) &&
+              (DCDC->DCDC_V14_REG & DCDC_DCDC_V14_REG_DCDC_V14_ENABLE_HV_Msk) &&
+              (DCDC->DCDC_V14_REG & DCDC_DCDC_V14_REG_DCDC_V14_ENABLE_LV_Msk)));
+
+
+    /* An attemp to switch to an unsteeled crystal might end up in hanging the system clock */
+    ret |= !da1469x_clock_is_xtal32m_settled();
+
+    /* 0 for success and 1 for failure. */
+    return ret;
+}
+
+static void
+da1469x_clock_sys_xtal32m_configure(void)
+{
+    assert(CRG_TOP->SYS_STAT_REG & CRG_TOP_SYS_STAT_REG_TIM_IS_UP_Msk);
+
+    /* Apply optimum values for XTAL32M registers not defined in CS section in OTP */
+    static uint32_t regs_buf[] = {
+        (uint32_t)&CRG_XTAL->CLK_FREQ_TRIM_REG
+    };
+
+    bool status_buf[ARRAY_COUNT(regs_buf)];
+
+    da1469x_trimv_is_reg_pairs_in_otp(regs_buf, ARRAY_COUNT(regs_buf), status_buf);
+
+    if (!status_buf[0]) {
+        CLK_FREQ_TRIM_REG_SET(XTAL32M_TRIM, CLK_FREQ_TRIM_REG__XTAL32M_TRIM__DEFAULT);
+    }
+
+    /* Configure OSF BOOST */
+    uint8_t cxcomp_phi_trim = 0;
+    uint8_t cxcomp_trim_cap = XTAL32M_CTRL2_REG_GET(XTAL32M_CXCOMP_TRIM_CAP);
+
+    if (cxcomp_trim_cap < 37) {
+        cxcomp_phi_trim = 3;
+    } else {
+        if (cxcomp_trim_cap < 123) {
+            cxcomp_phi_trim = 2;
+        }
+        else {
+            if (cxcomp_trim_cap < 170) {
+                cxcomp_phi_trim = 1;
+            }
+            else {
+                cxcomp_phi_trim = 0;
+            }
+        }
+    }
+    XTAL32M_CTRL2_REG_SET(XTAL32M_CXCOMP_PHI_TRIM, cxcomp_phi_trim);
+}
+
+static void
+da1469x_clock_sys_xtal32m_rdy_cnt_finetune(void)
+{
+#define XTALRDY_CTRL_REG_XTALRDY_CNT_MIN_LIMIT   ( 4 )
+#define XTALRDY_CTRL_REG_XTALRDY_CNT_OFFSET      ( 3 )
+
+    if (XTALRDY_CTRL_REG_GET(XTALRDY_CLK_SEL) == XTALRDY_CLK_SEL_32KHz) {
+        if (CRG_XTAL->XTAL32M_STAT1_REG & 0x100UL) {
+            int16_t xtalrdy_cnt = XTALRDY_CTRL_REG_GET(XTALRDY_CNT);
+            int16_t xtalrdy_stat = XTALRDY_CTRL_REG_XTALRDY_CNT_OFFSET - XTALRDY_STAT_REG_GET(XTALRDY_STAT);
+            xtalrdy_cnt += xtalrdy_stat;
+
+            if (xtalrdy_cnt < XTALRDY_CTRL_REG_XTALRDY_CNT_MIN_LIMIT) {
+                xtalrdy_cnt = XTALRDY_CTRL_REG_XTALRDY_CNT_MIN_LIMIT;
+            }
+            XTALRDY_CTRL_REG_SET(XTALRDY_CNT, xtalrdy_cnt);
+        }
+    }
 }
 
 void
 da1469x_clock_sys_xtal32m_init(void)
 {
-    uint32_t reg;
-    int xtalrdy_cnt;
+    da1469x_clock_sys_xtal32m_configure();
 
-    /*
-     * Number of 256kHz clock cycles (~4.085us) assuming worst case when actual frequency is 244800.
-     * RC32M is in range <30.6, 32.6> so 256Khz can ba as low as 30.6MHz / 125 = 244.8kHz.
-     */
-    xtalrdy_cnt = 1000 * 1000 / 4085;
-
-    reg = CRG_XTAL->XTALRDY_CTRL_REG;
-    reg &= ~(CRG_XTAL_XTALRDY_CTRL_REG_XTALRDY_CNT_Msk);
-    reg |= CRG_XTAL_XTALRDY_CTRL_REG_XTALRDY_CLK_SEL_Msk;
-    reg |= xtalrdy_cnt;
-    CRG_XTAL->XTALRDY_CTRL_REG = reg;
+    /* Select normal XTAL32M start-up */
+    XTALRDY_CTRL_REG_SET(XTALRDY_CLK_SEL, XTALRDY_CLK_SEL_32KHz);
 }
 
 void
