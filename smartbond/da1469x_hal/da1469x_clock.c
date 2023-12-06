@@ -25,11 +25,15 @@
 #include <da1469x_clock.h>
 #include <da1469x_pd.h>
 #include <da1469x_pdc.h>
+#include <da1469x_otp.h>
+#include <da1469x_trimv.h>
 
 #define XTAL32M_FREQ    32000000
 #define RC32M_FREQ      32000000
 #define PLL_FREQ        96000000
 #define XTAL32K_FREQ       32768
+
+#define ARRAY_COUNT(_arr)  (sizeof(_arr) / sizeof(_arr[0]))
 
 static uint32_t g_mcu_clock_rcx_freq;
 static uint32_t g_mcu_clock_rc32k_freq;
@@ -220,20 +224,28 @@ da1469x_clock_sys_xtal32m_enable(void)
 
     da1469x_pdc_set(idx);
     da1469x_pdc_ack(idx);
+
+    /* PDC will now take care of XTAL32M. Make sure that PDC is able to turn it off when going to sleep */
+    CRG_XTAL->XTAL32M_CTRL1_REG &= ~(CRG_XTAL_XTAL32M_CTRL1_REG_XTAL32M_XTAL_ENABLE_Msk);
 }
 
 void
 da1469x_clock_sys_xtal32m_switch(void)
 {
     if (CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_RC32M_Msk) {
+        assert(da1469x_clock_sys_xtal32m_switch_check_restrictions() == 0);
+
         CRG_TOP->CLK_SWITCH2XTAL_REG = CRG_TOP_CLK_SWITCH2XTAL_REG_SWITCH2XTAL_Msk;
     } else {
+        /* ~CLK_SEL_Msk == 0 means XTAL32M */
         CRG_TOP->CLK_CTRL_REG &= ~CRG_TOP_CLK_CTRL_REG_SYS_CLK_SEL_Msk;
     }
 
     while (!(CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_XTAL32M_Msk));
 
     SystemCoreClock = XTAL32M_FREQ;
+
+    da1469x_clock_adjust_otp_access_timings();
 }
 
 void
@@ -242,11 +254,22 @@ da1469x_clock_sys_xtal32m_wait_to_settle(void)
     uint32_t primask;
 
     primask = DA1469X_IRQ_DISABLE();
-    while (!da1469x_clock_is_xtal32m_settled()) {
-        __WFE();
-        __SEV();
-        __WFE();
+
+    NVIC_ClearPendingIRQ(XTAL32M_RDY_IRQn);
+
+    if (!da1469x_clock_is_xtal32m_settled()) {
+        NVIC_EnableIRQ(XTAL32M_RDY_IRQn);
+        while (!NVIC_GetPendingIRQ(XTAL32M_RDY_IRQn)) {
+            __WFE();
+            __SEV();
+            __WFE();
+        }
+        NVIC_DisableIRQ(XTAL32M_RDY_IRQn);
     }
+
+    /* XTALM32M_RDY_IRQn should be fired. The XTAL32M ready counter can be fine tuned. */
+    da1469x_clock_sys_xtal32m_rdy_cnt_finetune();
+
     DA1469X_IRQ_ENABLE(primask);
 }
 
@@ -276,10 +299,6 @@ da1469x_clock_lp_xtal32k_switch(void)
     CRG_TOP->CLK_CTRL_REG = (CRG_TOP->CLK_CTRL_REG &
                              ~CRG_TOP_CLK_CTRL_REG_LP_CLK_SEL_Msk) |
                             (2 << CRG_TOP_CLK_CTRL_REG_LP_CLK_SEL_Pos);
-    /* If system is running on LP clock update SystemCoreClock */
-    if (CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_LP_CLK_Msk) {
-        SystemCoreClock = XTAL32K_FREQ;
-    }
 }
 
 void
@@ -294,11 +313,6 @@ da1469x_clock_lp_rcx_switch(void)
     CRG_TOP->CLK_CTRL_REG = (CRG_TOP->CLK_CTRL_REG &
                              ~CRG_TOP_CLK_CTRL_REG_LP_CLK_SEL_Msk) |
                             (1 << CRG_TOP_CLK_CTRL_REG_LP_CLK_SEL_Pos);
-
-    /* If system is running on LP clock update SystemCoreClock */
-    if (CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_LP_CLK_Msk) {
-        SystemCoreClock = g_mcu_clock_rcx_freq;
-    }
 }
 
 /**
@@ -342,10 +356,83 @@ da1469x_clock_lp_rcx_calibrate(void)
     g_mcu_clock_rcx_freq = da1469x_clock_calibrate(3, MCU_RCX_CAL_REF_CNT);
 }
 
+#define RC32K_TARGET_FREQ   32000
+#define RC32K_TRIM_MIN      0
+#define RC32K_TRIM_MAX      15
+
+static inline uint32_t
+rc32k_trim_get(void)
+{
+    return (CRG_TOP->CLK_RC32K_REG & CRG_TOP_CLK_RC32K_REG_RC32K_TRIM_Msk) >>
+           CRG_TOP_CLK_RC32K_REG_RC32K_TRIM_Pos;
+}
+
+static inline void
+rc32k_trim_set(uint32_t trim)
+{
+    CRG_TOP->CLK_RC32K_REG =
+        (CRG_TOP->CLK_RC32K_REG & ~CRG_TOP_CLK_RC32K_REG_RC32K_TRIM_Msk) |
+        (trim << CRG_TOP_CLK_RC32K_REG_RC32K_TRIM_Pos);
+}
+
 void
 da1469x_clock_lp_rc32k_calibrate(void)
 {
-    g_mcu_clock_rc32k_freq = da1469x_clock_calibrate(0, 100);
+    uint32_t trim;
+    uint32_t trim_prev;
+    uint32_t freq;
+    uint32_t freq_prev;
+    uint32_t freq_delta;
+    uint32_t freq_delta_prev;
+    bool trim_ok;
+
+    if (!(CRG_TOP->CLK_RC32K_REG & CRG_TOP_CLK_RC32K_REG_RC32K_ENABLE_Msk)) {
+        return;
+    }
+
+    freq = 0;
+    freq_delta = INT32_MAX;
+
+    trim = rc32k_trim_get();
+    trim_prev = trim;
+    trim_ok = false;
+
+    do {
+        freq_prev = freq;
+        freq_delta_prev = freq_delta;
+
+        freq = da1469x_clock_calibrate(0, 1);
+
+        freq_delta = freq - RC32K_TARGET_FREQ;
+        freq_delta = (int32_t)freq_delta < 0 ? -freq_delta : freq_delta;
+
+        if (freq_delta > freq_delta_prev) {
+            /* Previous trim value was closer to target frequency, use it */
+            freq = freq_prev;
+            rc32k_trim_set(trim_prev);
+            trim_ok = true;
+        } else if (freq > RC32K_TARGET_FREQ) {
+            /* Decrease trim value if possible */
+            if (trim > RC32K_TRIM_MIN) {
+                trim_prev = trim;
+                rc32k_trim_set(--trim);
+            } else {
+                trim_ok = true;
+            }
+        } else if (freq < RC32K_TARGET_FREQ) {
+            /* Increase trim value if possible */
+            if (trim < RC32K_TRIM_MAX) {
+                trim_prev = trim;
+                rc32k_trim_set(++trim);
+            } else {
+                trim_ok = true;
+            }
+        } else {
+            trim_ok = true;
+        }
+    } while (!trim_ok);
+
+    g_mcu_clock_rc32k_freq = freq;
 }
 
 void
@@ -404,6 +491,10 @@ da1469x_delay_us(uint32_t delay_us)
 void
 da1469x_clock_sys_pll_enable(void)
 {
+    /* VDD voltage should be to 1.2V prior to enabling PLL (VDD_LEVEL_Msk means 1.2V) */
+    assert((CRG_TOP->POWER_CTRL_REG & CRG_TOP_POWER_CTRL_REG_VDD_LEVEL_Msk)
+                                        == CRG_TOP_POWER_CTRL_REG_VDD_LEVEL_Msk);
+
     /* Start PLL LDO if not done yet */
     if ((CRG_XTAL->PLL_SYS_STATUS_REG & CRG_XTAL_PLL_SYS_STATUS_REG_LDO_PLL_OK_Msk) == 0) {
         CRG_XTAL->PLL_SYS_CTRL1_REG |= CRG_XTAL_PLL_SYS_CTRL1_REG_LDO_PLL_ENABLE_Msk;
@@ -433,14 +524,13 @@ da1469x_clock_sys_pll_enable(void)
 void
 da1469x_clock_sys_pll_disable(void)
 {
-    while (CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_PLL96M_Msk) {
-        CRG_TOP->CLK_SWITCH2XTAL_REG = CRG_TOP_CLK_SWITCH2XTAL_REG_SWITCH2XTAL_Msk;
-
-        SystemCoreClock = XTAL32M_FREQ;
-    }
+    /* Switch from PLL is only allowed when the new system clock is XTAL32M */
+    da1469x_clock_sys_xtal32m_switch();
 
     CRG_XTAL->PLL_SYS_CTRL1_REG &= ~(CRG_XTAL_PLL_SYS_CTRL1_REG_PLL_EN_Msk |
                                      CRG_XTAL_PLL_SYS_CTRL1_REG_LDO_PLL_ENABLE_Msk);
+
+    CRG_XTAL->XTAL32M_CTRL0_REG &= ~(CRG_XTAL_XTAL32M_CTRL0_REG_XTAL32M_DXTAL_SYSPLL_ENABLE_Msk);
 }
 
 void
@@ -458,6 +548,16 @@ da1469x_clock_pll_wait_to_lock(void)
             __WFI();
         }
         NVIC_DisableIRQ(PLL_LOCK_IRQn);
+
+        /*
+         * Due to a metastability issue, the PLL lock interrupt may be fired earlier
+         * and before the PLL is actually locked. Therefore, an attempt to switch to
+         * an unlocked PLL might end up hanging the system clock.
+         * Make sure that PLL is locked by polling the corresponding status register
+         * as the actual time interval between two successive PLL lock interrupts is
+         *  uncertain.
+         */
+       while (!da1469x_clock_is_pll_locked());
     }
 
     DA1469X_IRQ_ENABLE(primask);
@@ -466,10 +566,14 @@ da1469x_clock_pll_wait_to_lock(void)
 void
 da1469x_clock_sys_pll_switch(void)
 {
+    assert(da1469x_clock_sys_pll_switch_check_restrictions() != 0);
+
     /* CLK_SEL_Msk == 3 means PLL */
     CRG_TOP->CLK_CTRL_REG |= CRG_TOP_CLK_CTRL_REG_SYS_CLK_SEL_Msk;
 
     while (!(CRG_TOP->CLK_CTRL_REG & CRG_TOP_CLK_CTRL_REG_RUNNING_AT_PLL96M_Msk));
 
     SystemCoreClock = PLL_FREQ;
+
+    da1469x_clock_adjust_otp_access_timings();
 }
